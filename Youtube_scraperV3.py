@@ -58,14 +58,11 @@ def scrape_youtube(course_name, output_dir="output"):
 
     with sync_playwright() as playwright:
         # Configure browser options for Render environment
-        browser_args = {}
+        browser_args = {'headless': True}  # Set headless mode for all environments
         if os.environ.get('RENDER') == 'true':
-            browser_args = {
-                'headless': True,
-                'executable_path': os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '/opt/render/.playwright') + '/chromium/chrome-linux/chrome'
-            }
+            browser_args['executable_path'] = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '/opt/render/.playwright') + '/chromium/chrome-linux/chrome'
         
-        browser = playwright.chromium.launch(headless=True, **browser_args)
+        browser = playwright.chromium.launch(**browser_args)
         page = browser.new_page()
         
         try:
