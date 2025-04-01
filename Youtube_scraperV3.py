@@ -6,6 +6,7 @@ from datetime import datetime
 import urllib.parse
 import argparse
 import os
+import subprocess
 
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
@@ -56,195 +57,237 @@ def scrape_youtube(course_name, output_dir="output"):
         }
     }
 
-    with sync_playwright() as playwright:
-        # Configure browser options for Render environment
-        browser_args = {'headless': True}  # Set headless mode for all environments
-        if os.environ.get('RENDER') == 'true':
-            browser_args['executable_path'] = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '/opt/render/.playwright') + '/chromium/chrome-linux/chrome'
-        
-        browser = playwright.chromium.launch(**browser_args)
-        page = browser.new_page()
-        
+    # Try to install browser if we're on Render
+    if os.environ.get('RENDER') == 'true':
         try:
-            # Get the playlist search URL
-            search_url = get_playlist_search_url(course_name)
-            video_data["metadata"]["url"] = search_url
+            log.debug("Running on Render, attempting to install browser...")
+            # Set environment variable for browser path
+            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/tmp/pw-browsers'
+            # Attempt to install browser
+            result = subprocess.run(['playwright', 'install', 'chromium'], 
+                                   capture_output=True, text=True)
+            log.debug(f"Browser installation result: {result.stdout}")
+            if result.stderr:
+                log.warning(f"Browser installation error: {result.stderr}")
+        except Exception as e:
+            log.error(f"Failed to install browser: {e}")
+
+    with sync_playwright() as playwright:
+        try:
+            # Configure browser options for different environments
+            browser_options = {
+                'headless': True,
+            }
             
-            # Navigate directly to the playlist search results
-            page.goto(search_url)
-            
-            # Wait for the page to load completely
-            page.wait_for_load_state('networkidle')
-            page.wait_for_load_state('domcontentloaded')
-            
-            # Wait a bit for dynamic content to load
-            time.sleep(3)
-            
-            # Try different selectors for playlist items
-            selectors = [
-                'ytd-item-section-renderer ytd-lockup-view-model a.yt-lockup-metadata-view-model-wiz__title',
-                'ytd-item-section-renderer a#video-title',
-                'ytd-item-section-renderer a[href*="/playlist?list="]',
-                'ytd-item-section-renderer a[href*="&list="]'
-            ]
-            
-            first_playlist = None
-            for selector in selectors:
-                try:
-                    log.debug(f"Trying selector: {selector}")
-                    # Wait for any element matching the selector
-                    page.wait_for_selector(selector, timeout=5000)
-                    first_playlist = page.locator(selector).first
-                    if first_playlist.is_visible():
-                        log.debug(f"Found playlist with selector: {selector}")
-                        break
-                except Exception as e:
-                    log.debug(f"Selector {selector} failed: {e}")
-                    continue
-            
-            if not first_playlist:
-                raise Exception("Could not find any playlist items")
-            
-            # Get playlist information
-            video_title = first_playlist.text_content()
-            video_link = first_playlist.get_attribute('href')
-            
-            # Ensure we have a valid link
-            if not video_link or not ('/playlist?list=' in video_link or '&list=' in video_link):
-                raise Exception("Invalid playlist link found")
-            
-            # Get playlist title from search results using the correct selector
-            try:
-                playlist_title = page.locator('#contents > yt-lockup-view-model:nth-child(2) > div > div > yt-lockup-metadata-view-model > div.yt-lockup-metadata-view-model-wiz__text-container > h3').text_content()
-                video_data["playlist_info"]["title"] = playlist_title.strip()
-                log.debug(f"Found playlist title: {playlist_title}")
-            except Exception as e:
-                log.warning(f"Could not get playlist title from search results: {e}")
-                video_data["playlist_info"]["title"] = video_title.strip()
-            
-            # Click the playlist
-            first_playlist.click()
-            
-            # Wait for video page to load
-            page.wait_for_load_state('networkidle')
-            page.wait_for_load_state('domcontentloaded')
-            
-            # Get channel name
-            try:
-                channel_name = page.locator('ytd-channel-name yt-formatted-string a').first.text_content()
-                video_data["playlist_info"]["channel"] = channel_name.strip()
-            except Exception as e:
-                log.warning(f"Could not get channel name: {e}")
-                video_data["playlist_info"]["channel"] = "Unknown Channel"
-            
-            # Store playlist URL with full URL construction
-            video_data["playlist_info"]["url"] = f"https://www.youtube.com{video_link}"
-            
-            # Wait for playlist videos to load
-            page.wait_for_selector('#contents ytd-playlist-video-renderer', timeout=10000)
-            
-            # Scroll to load all thumbnails
-            log.debug("Starting to scroll to load all thumbnails...")
-            last_height = page.evaluate('document.documentElement.scrollHeight')
-            while True:
-                # Scroll down
-                page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)')
-                # Wait for new content to load
-                time.sleep(2)
+            # Check if we're running on Render and need special handling
+            if os.environ.get('RENDER') == 'true':
+                # First try the default location
+                chrome_path = '/tmp/pw-browsers/chromium/chrome-linux/chrome'
                 
-                # Calculate new scroll height
-                new_height = page.evaluate('document.documentElement.scrollHeight')
+                # Check if chromium executable exists
+                if not os.path.exists(chrome_path):
+                    log.warning(f"Chrome not found at {chrome_path}")
+                    # Try alternate locations
+                    alternate_paths = [
+                        '/opt/render/.cache/ms-playwright/chromium-1067/chrome-linux/chrome',
+                        '/home/render/.cache/ms-playwright/chromium-1067/chrome-linux/chrome'
+                    ]
+                    
+                    for path in alternate_paths:
+                        if os.path.exists(path):
+                            chrome_path = path
+                            log.debug(f"Found Chrome at alternate path: {chrome_path}")
+                            break
+                    
+                browser_options['executable_path'] = chrome_path
+            
+            log.debug(f"Launching browser with options: {browser_options}")
+            browser = playwright.chromium.launch(**browser_options)
+            page = browser.new_page()
+            
+            try:
+                # Get the playlist search URL
+                search_url = get_playlist_search_url(course_name)
+                video_data["metadata"]["url"] = search_url
                 
-                # Break if no more new content (height didn't change)
-                if new_height == last_height:
-                    break
-                    
-                last_height = new_height
-                log.debug(f"Scrolled to height: {new_height}")
-            
-            # Scroll back to top
-            page.evaluate('window.scrollTo(0, 0)')
-            time.sleep(1)  # Wait for any final loading
-            
-            # Get all playlist videos
-            video_items = page.locator('#contents ytd-playlist-video-renderer').all()
-            log.debug(f"Found {len(video_items)} videos in playlist")
-            
-            # Extract information for each video
-            for index, item in enumerate(video_items):
-                try:
-                    video_info = {}
-                    
-                    # Get video title
-                    title_element = item.locator('#video-title')
-                    video_info["title"] = title_element.text_content().strip()
-                    video_info["url"] = f"https://www.youtube.com{title_element.get_attribute('href')}"
-                    
-                    # Get channel name
+                # Navigate directly to the playlist search results
+                page.goto(search_url)
+                
+                # Wait for the page to load completely
+                page.wait_for_load_state('networkidle')
+                page.wait_for_load_state('domcontentloaded')
+                
+                # Wait a bit for dynamic content to load
+                time.sleep(3)
+                
+                # Try different selectors for playlist items
+                selectors = [
+                    'ytd-item-section-renderer ytd-lockup-view-model a.yt-lockup-metadata-view-model-wiz__title',
+                    'ytd-item-section-renderer a#video-title',
+                    'ytd-item-section-renderer a[href*="/playlist?list="]',
+                    'ytd-item-section-renderer a[href*="&list="]'
+                ]
+                
+                first_playlist = None
+                for selector in selectors:
                     try:
-                        channel_element = item.locator('#channel-name #text')
-                        video_info["channel"] = channel_element.text_content().strip()
-                    except:
-                        video_info["channel"] = video_data["playlist_info"]["channel"]
-                    
-                    # Get thumbnail
-                    try:
-                        thumbnail_element = item.locator('ytd-thumbnail img')
-                        video_info["thumbnail"] = thumbnail_element.get_attribute('src')
-                    except:
-                        video_info["thumbnail"] = None
-                    
-                    # Get duration
-                    try:
-                        duration_element = item.locator('ytd-thumbnail-overlay-time-status-renderer .badge-shape-wiz__text')
-                        duration_text = duration_element.text_content().strip()
-                        video_info["duration"] = duration_text
-                        
-                        # Parse duration and filter videos
-                        duration_seconds = parse_duration(duration_text)
-                        if duration_seconds < 60 :
-                            log.debug(f"Skipping video '{video_info['title']}' due to duration: {duration_text}")
-                            continue
-                            
+                        log.debug(f"Trying selector: {selector}")
+                        # Wait for any element matching the selector
+                        page.wait_for_selector(selector, timeout=5000)
+                        first_playlist = page.locator(selector).first
+                        if first_playlist.is_visible():
+                            log.debug(f"Found playlist with selector: {selector}")
+                            break
                     except Exception as e:
-                        log.warning(f"Failed to get duration: {e}")
-                        video_info["duration"] = None
-                        continue  # Skip videos without duration
-                    
-                    # Get metadata (views and upload time)
-                    try:
-                        metadata_elements = item.locator('#metadata-line yt-formatted-string').all()
-                        if len(metadata_elements) >= 2:
-                            video_info["views"] = metadata_elements[0].text_content().strip()
-                            video_info["upload_time"] = metadata_elements[1].text_content().strip()
-                    except:
-                        video_info["views"] = None
-                        video_info["upload_time"] = None
-                    
-                    video_data["videos"].append(video_info)
-                    
-                    # Scroll after every 6th video
-                    if (index + 1) % 6 == 0 and index < len(video_items) - 1:
-                        log.debug(f"Scrolling after video {index + 1}")
-                        # Scroll to the next video
-                        item.scroll_into_view_if_needed()
-                        time.sleep(1)  # Wait for thumbnail to load
-                    
+                        log.debug(f"Selector {selector} failed: {e}")
+                        continue
+                
+                if not first_playlist:
+                    raise Exception("Could not find any playlist items")
+                
+                # Get playlist information
+                video_title = first_playlist.text_content()
+                video_link = first_playlist.get_attribute('href')
+                
+                # Ensure we have a valid link
+                if not video_link or not ('/playlist?list=' in video_link or '&list=' in video_link):
+                    raise Exception("Invalid playlist link found")
+                
+                # Get playlist title from search results using the correct selector
+                try:
+                    playlist_title = page.locator('#contents > yt-lockup-view-model:nth-child(2) > div > div > yt-lockup-metadata-view-model > div.yt-lockup-metadata-view-model-wiz__text-container > h3').text_content()
+                    video_data["playlist_info"]["title"] = playlist_title.strip()
+                    log.debug(f"Found playlist title: {playlist_title}")
                 except Exception as e:
-                    log.warning(f"Failed to extract video info: {e}")
-                    continue
-            
-            # Print formatted data
-            print("\nPlaylist Information:")
-            print(json.dumps(video_data, indent=2, ensure_ascii=False))
-            
-            # Save to JSON file
-            output_file = save_to_json(video_data, output_dir)
-            print(f"\nData saved to: {output_file}")
-            
-            # Wait for demo purposes
-            page.wait_for_timeout(5000)
-            
+                    log.warning(f"Could not get playlist title from search results: {e}")
+                    video_data["playlist_info"]["title"] = video_title.strip()
+                
+                # Click the playlist
+                first_playlist.click()
+                
+                # Wait for video page to load
+                page.wait_for_load_state('networkidle')
+                page.wait_for_load_state('domcontentloaded')
+                
+                # Get channel name
+                try:
+                    channel_name = page.locator('ytd-channel-name yt-formatted-string a').first.text_content()
+                    video_data["playlist_info"]["channel"] = channel_name.strip()
+                except Exception as e:
+                    log.warning(f"Could not get channel name: {e}")
+                    video_data["playlist_info"]["channel"] = "Unknown Channel"
+                
+                # Store playlist URL with full URL construction
+                video_data["playlist_info"]["url"] = f"https://www.youtube.com{video_link}"
+                
+                # Wait for playlist videos to load
+                page.wait_for_selector('#contents ytd-playlist-video-renderer', timeout=10000)
+                
+                # Scroll to load all thumbnails
+                log.debug("Starting to scroll to load all thumbnails...")
+                last_height = page.evaluate('document.documentElement.scrollHeight')
+                while True:
+                    # Scroll down
+                    page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)')
+                    # Wait for new content to load
+                    time.sleep(2)
+                    
+                    # Calculate new scroll height
+                    new_height = page.evaluate('document.documentElement.scrollHeight')
+                    
+                    # Break if no more new content (height didn't change)
+                    if new_height == last_height:
+                        break
+                        
+                    last_height = new_height
+                    log.debug(f"Scrolled to height: {new_height}")
+                
+                # Scroll back to top
+                page.evaluate('window.scrollTo(0, 0)')
+                time.sleep(1)  # Wait for any final loading
+                
+                # Get all playlist videos
+                video_items = page.locator('#contents ytd-playlist-video-renderer').all()
+                log.debug(f"Found {len(video_items)} videos in playlist")
+                
+                # Extract information for each video
+                for index, item in enumerate(video_items):
+                    try:
+                        video_info = {}
+                        
+                        # Get video title
+                        title_element = item.locator('#video-title')
+                        video_info["title"] = title_element.text_content().strip()
+                        video_info["url"] = f"https://www.youtube.com{title_element.get_attribute('href')}"
+                        
+                        # Get channel name
+                        try:
+                            channel_element = item.locator('#channel-name #text')
+                            video_info["channel"] = channel_element.text_content().strip()
+                        except:
+                            video_info["channel"] = video_data["playlist_info"]["channel"]
+                        
+                        # Get thumbnail
+                        try:
+                            thumbnail_element = item.locator('ytd-thumbnail img')
+                            video_info["thumbnail"] = thumbnail_element.get_attribute('src')
+                        except:
+                            video_info["thumbnail"] = None
+                        
+                        # Get duration
+                        try:
+                            duration_element = item.locator('ytd-thumbnail-overlay-time-status-renderer .badge-shape-wiz__text')
+                            duration_text = duration_element.text_content().strip()
+                            video_info["duration"] = duration_text
+                            
+                            # Parse duration and filter videos
+                            duration_seconds = parse_duration(duration_text)
+                            if duration_seconds < 60 :
+                                log.debug(f"Skipping video '{video_info['title']}' due to duration: {duration_text}")
+                                continue
+                                
+                        except Exception as e:
+                            log.warning(f"Failed to get duration: {e}")
+                            video_info["duration"] = None
+                            continue  # Skip videos without duration
+                        
+                        # Get metadata (views and upload time)
+                        try:
+                            metadata_elements = item.locator('#metadata-line yt-formatted-string').all()
+                            if len(metadata_elements) >= 2:
+                                video_info["views"] = metadata_elements[0].text_content().strip()
+                                video_info["upload_time"] = metadata_elements[1].text_content().strip()
+                        except:
+                            video_info["views"] = None
+                            video_info["upload_time"] = None
+                        
+                        video_data["videos"].append(video_info)
+                        
+                        # Scroll after every 6th video
+                        if (index + 1) % 6 == 0 and index < len(video_items) - 1:
+                            log.debug(f"Scrolling after video {index + 1}")
+                            # Scroll to the next video
+                            item.scroll_into_view_if_needed()
+                            time.sleep(1)  # Wait for thumbnail to load
+                        
+                    except Exception as e:
+                        log.warning(f"Failed to extract video info: {e}")
+                        continue
+                
+                # Print formatted data
+                print("\nPlaylist Information:")
+                print(json.dumps(video_data, indent=2, ensure_ascii=False))
+                
+                # Save to JSON file
+                output_file = save_to_json(video_data, output_dir)
+                print(f"\nData saved to: {output_file}")
+                
+                # Wait for demo purposes
+                page.wait_for_timeout(5000)
+                
+            except Exception as e:
+                log.error(f"Error: {e}")
+                raise e
         except Exception as e:
             log.error(f"Error: {e}")
             raise e
