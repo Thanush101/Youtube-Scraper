@@ -7,6 +7,9 @@ import glob
 from werkzeug.utils import secure_filename
 from datetime import datetime
 
+# Set Playwright browser path for containerized environments
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/tmp/pw-browsers"
+
 app = Flask(__name__)
 
 # Ensure the output directory exists
